@@ -1,0 +1,162 @@
+#include <gtest/gtest.h>
+#include "../src/core/order_manager.h"
+#include "../src/gateway/mock_cex_gateway.h"
+#include "../src/gateway/mock_dex_gateway.h"
+#include "dummy_signal_generator.h"
+#include <thread>
+#include <chrono>
+#include <cmath>
+
+using namespace oem;
+
+class ArbCoordinatorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        UuidGenerator::reset();
+
+        binance_gw_ = std::make_unique<MockCexGateway>(MockCexGateway::Config{
+            .exchange_id = Exchange::BINANCE,
+            .fill_latency_ms = 50
+        });
+        bybit_gw_ = std::make_unique<MockCexGateway>(MockCexGateway::Config{
+            .exchange_id = Exchange::BYBIT,
+            .fill_latency_ms = 50
+        });
+        hl_gw_ = std::make_unique<MockDexGateway>(MockDexGateway::Config{
+            .block_time_ms = 1000,
+            .signing_latency_ms = 5
+        });
+
+        gateways_[Exchange::BINANCE] = binance_gw_.get();
+        gateways_[Exchange::BYBIT] = bybit_gw_.get();
+        gateways_[Exchange::HYPERLIQUID] = hl_gw_.get();
+    }
+
+    std::unique_ptr<OrderManager> make_manager() {
+        OrderManager::Config config{
+            .signal_config = {.backtest_freshness_ms = 5000, .direct_freshness_ms = 200},
+            .portfolio_config = {.max_leverage = 10.0, .initial_cash = 100000.0},
+            .arb_config = {.assembly_deadline_ms = 100, .unwind_timeout_ms = 3000, .max_risk_window_ms = 2000}
+        };
+        return std::make_unique<OrderManager>(config, gateways_);
+    }
+
+    OrderManager::GatewayMap gateways_;
+    std::unique_ptr<MockCexGateway> binance_gw_;
+    std::unique_ptr<MockCexGateway> bybit_gw_;
+    std::unique_ptr<MockDexGateway> hl_gw_;
+};
+
+// TC7: Both legs fill, verify status transitions and spread calculation
+TEST_F(ArbCoordinatorTest, TC7_ArbBothLegsFill) {
+    auto mgr = make_manager();
+    auto signals = DummySignalGenerator::arb_success();
+
+    for (auto& [sig, delay_ms] : signals) {
+        auto result = mgr->process_signal(sig);
+        EXPECT_TRUE(result.success) << "Signal failed: " << result.reason;
+    }
+
+    // Wait for CEX fill (~50ms) + DEX block confirm (~1000ms) + buffer
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+    auto pair = mgr->arb_coordinator().get_pair("arb-001");
+    EXPECT_EQ(pair.status, ArbPairStatus::COMPLETED)
+        << "Expected COMPLETED, got " << to_string(pair.status);
+
+    // Both legs should be filled
+    ASSERT_TRUE(pair.cex_leg.has_value());
+    ASSERT_TRUE(pair.dex_leg.has_value());
+    EXPECT_EQ(pair.cex_leg->status, OrderStatus::FILLED);
+    EXPECT_EQ(pair.dex_leg->status, OrderStatus::FILLED);
+
+    // Risk window should be roughly 950ms (1000ms DEX - 50ms CEX)
+    double risk_window_ms = pair.risk_window_ns / 1e6;
+    EXPECT_GT(risk_window_ms, 500.0) << "Risk window too small: " << risk_window_ms << "ms";
+    EXPECT_LT(risk_window_ms, 2000.0) << "Risk window too large: " << risk_window_ms << "ms";
+
+    // Expected spread: (100050 - 100000) / 100000 * 10000 = 5.0 bps
+    EXPECT_NEAR(pair.expected_spread_bps, 5.0, 0.1);
+
+    // Realized spread should be ~5.0 bps (no slippage configured)
+    EXPECT_NEAR(pair.realized_spread_bps, 5.0, 0.5);
+}
+
+// TC8: DEX rejects, verify unwind
+TEST_F(ArbCoordinatorTest, TC8_ArbDexFailure) {
+    // Configure DEX gateway to reject
+    hl_gw_->set_config(MockDexGateway::Config{
+        .block_time_ms = 1000,
+        .signing_latency_ms = 5,
+        .fill_probability = 0.0,
+        .reject_probability = 1.0
+    });
+
+    auto mgr = make_manager();
+    auto signals = DummySignalGenerator::arb_dex_failure();
+
+    for (auto& [sig, delay_ms] : signals) {
+        auto result = mgr->process_signal(sig);
+        EXPECT_TRUE(result.success) << "Signal failed: " << result.reason;
+    }
+
+    // Wait for CEX fill (~50ms) + DEX reject (~1000ms) + unwind (~200ms) + buffer
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+
+    auto pair = mgr->arb_coordinator().get_pair("arb-002");
+
+    // Should have gone through UNWINDING
+    // Final state should be COMPLETED or FAILED
+    EXPECT_TRUE(pair.status == ArbPairStatus::COMPLETED ||
+                pair.status == ArbPairStatus::UNWINDING ||
+                pair.status == ArbPairStatus::FAILED)
+        << "Expected terminal arb status, got " << to_string(pair.status);
+
+    // CEX leg should have been filled initially
+    ASSERT_TRUE(pair.cex_leg.has_value());
+    EXPECT_EQ(pair.cex_leg->status, OrderStatus::FILLED);
+
+    // DEX leg should be rejected
+    ASSERT_TRUE(pair.dex_leg.has_value());
+    EXPECT_EQ(pair.dex_leg->status, OrderStatus::REJECTED);
+}
+
+// TC9: Both fill with DEX slippage, verify spread erosion
+TEST_F(ArbCoordinatorTest, TC9_ArbLatencyAsymmetry) {
+    // Configure DEX with slippage and higher block time
+    hl_gw_->set_config(MockDexGateway::Config{
+        .block_time_ms = 1200,
+        .signing_latency_ms = 5,
+        .fill_probability = 1.0,
+        .reject_probability = 0.0,
+        .slippage_bps = 20.0   // 20 bps slippage on DEX
+    });
+
+    auto mgr = make_manager();
+    auto signals = DummySignalGenerator::arb_latency_asymmetry();
+
+    for (auto& [sig, delay_ms] : signals) {
+        auto result = mgr->process_signal(sig);
+        EXPECT_TRUE(result.success) << "Signal failed: " << result.reason;
+    }
+
+    // Wait for fills
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+
+    auto pair = mgr->arb_coordinator().get_pair("arb-003");
+    EXPECT_EQ(pair.status, ArbPairStatus::COMPLETED)
+        << "Expected COMPLETED, got " << to_string(pair.status);
+
+    // Expected spread: (3003 - 3000) / 3000 * 10000 = 10.0 bps
+    EXPECT_NEAR(pair.expected_spread_bps, 10.0, 0.1);
+
+    // DEX SELL with 20bps slippage: sell price = 3003 * (1 - 20/10000) = 3003 * 0.998 ≈ 2997
+    // So realized = (2997 - 3000) / 3000 * 10000 ≈ -10 bps (negative = loss)
+    // The realized spread should be significantly less than expected
+    EXPECT_LT(pair.realized_spread_bps, pair.expected_spread_bps)
+        << "Realized spread should be less than expected due to slippage";
+
+    // Risk window should be > 1000ms due to 1200ms block time
+    double risk_window_ms = pair.risk_window_ns / 1e6;
+    EXPECT_GT(risk_window_ms, 800.0) << "Risk window: " << risk_window_ms << "ms";
+}

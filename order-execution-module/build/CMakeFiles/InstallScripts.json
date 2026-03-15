@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/cmake_install.cmake",
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/json-build/cmake_install.cmake",
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/spdlog-build/cmake_install.cmake",
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/googletest-build/cmake_install.cmake",
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/googletest-build/googlemock/cmake_install.cmake",
+		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/googletest-build/googletest/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

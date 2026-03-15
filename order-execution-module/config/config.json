@@ -1,0 +1,43 @@
+{
+  "exchanges": {
+    "binance": {
+      "type": "CEX",
+      "rest_endpoint": "https://fapi.binance.com",
+      "ws_endpoint": "wss://fstream.binance.com/ws",
+      "rate_limit_per_min": 2400,
+      "order_timeout_ms": 3000,
+      "avg_fill_latency_ms": 50
+    },
+    "bybit": {
+      "type": "CEX",
+      "rest_endpoint": "https://api.bybit.com",
+      "ws_endpoint": "wss://stream.bybit.com/v5/private",
+      "rate_limit_per_min": 1440,
+      "order_timeout_ms": 3000,
+      "avg_fill_latency_ms": 50
+    },
+    "hyperliquid": {
+      "type": "DEX",
+      "rest_endpoint": "https://api.hyperliquid.xyz",
+      "ws_endpoint": "wss://api.hyperliquid.xyz/ws",
+      "rate_limit_per_min": 1200,
+      "order_timeout_ms": 5000,
+      "avg_fill_latency_ms": 1000,
+      "block_time_ms": 1000,
+      "signing_latency_ms": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash": 100000.0,
+    "max_leverage": 10.0
+  },
+  "signal_freshness": {
+    "BACKTEST_VALIDATED_ms": 5000,
+    "DIRECT_ms": 200
+  },
+  "arb": {
+    "assembly_deadline_ms": 100,
+    "unwind_timeout_ms": 3000,
+    "max_risk_window_ms": 2000
+  }
+}

@@ -1,0 +1,27 @@
+# Build output and temporary files
+order-execution-module/build/
+
+# CMake user files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+*.cmake
+
+# Visual Studio Code
+.vscode/
+
+# macOS metadata
+.DS_Store
+
+# Python env
+venv/
+.env
+
+# Logs
+*.log
+
+# Backup files
+*~
+*.swp
