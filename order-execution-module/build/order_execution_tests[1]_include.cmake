@@ -1,5 +1,0 @@
-if(EXISTS "/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/order_execution_tests[1]_tests.cmake")
-  include("/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/order_execution_tests[1]_tests.cmake")
-else()
-  add_test(order_execution_tests_NOT_BUILT order_execution_tests_NOT_BUILT)
-endif()

@@ -9,8 +9,9 @@ Makefile
 install_manifest.txt
 *.cmake
 
-# Visual Studio Code
+# VS Code and Claude settings
 .vscode/
+.claude/
 
 # macOS metadata
 .DS_Store

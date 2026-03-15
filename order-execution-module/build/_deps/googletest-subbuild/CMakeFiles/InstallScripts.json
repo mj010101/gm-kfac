@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/minjun/Desktop/MEV_Quant/gm-kfac/order-execution-module/build/_deps/googletest-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

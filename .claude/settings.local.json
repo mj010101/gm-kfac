@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(./order_execution_tests 2>&1)",
-      "Bash(./order_execution 2>&1 | grep -E \"\\(TEST:|Result:|PASS|FAIL|SUMMARY|risk_window|spread|Portfolio|ArbPair\\)\" | head -40)",
-      "Bash(./order_execution 2>&1 | tail -20)"
-    ]
-  }
-}
