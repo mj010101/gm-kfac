@@ -1,8 +1,7 @@
 #pragma once
 #include "order.h"
 #include <cstdint>
-#include <optional>
-#include <string>
+#include <cstring>
 
 namespace oem {
 
@@ -32,9 +31,11 @@ inline const char* to_string(ArbPairStatus s) {
 }
 
 struct ArbPair {
-    std::string     group_id;
-    std::optional<Order> cex_leg;
-    std::optional<Order> dex_leg;
+    char            group_id[16] = {};
+    bool            has_cex_leg = false;
+    Order           cex_leg;
+    bool            has_dex_leg = false;
+    Order           dex_leg;
     ArbPairStatus   status = ArbPairStatus::ASSEMBLING;
     double          expected_spread_bps = 0.0;
     double          realized_spread_bps = 0.0;
@@ -44,8 +45,13 @@ struct ArbPair {
     int64_t         risk_window_ns = 0;
     int64_t         dispatch_deadline_ns = 0;
 
+    void set_group_id(const std::string& g) {
+        std::strncpy(group_id, g.c_str(), 15);
+        group_id[15] = '\0';
+    }
+
     bool both_legs_present() const {
-        return cex_leg.has_value() && dex_leg.has_value();
+        return has_cex_leg && has_dex_leg;
     }
 };
 

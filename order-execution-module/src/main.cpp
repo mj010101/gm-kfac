@@ -2,12 +2,11 @@
 #include "gateway/mock_cex_gateway.h"
 #include "gateway/mock_dex_gateway.h"
 #include "../test/dummy_signal_generator.h"
-#include "util/logger.h"
+#include "util/async_logger.h"
 #include "util/uuid.h"
 #include "util/latency_tracker.h"
 
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <fstream>
@@ -15,6 +14,9 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <vector>
+#include <numeric>
 
 using namespace oem;
 using json = nlohmann::json;
@@ -60,20 +62,20 @@ void print_order(const Order& order) {
 void print_arb_pair(const ArbPair& pair) {
     std::cout << "  ArbPair: " << pair.group_id
               << " | status=" << to_string(pair.status) << "\n";
-    if (pair.cex_leg) {
-        std::cout << "    CEX: " << pair.cex_leg->order_id
-                  << " | " << to_string(pair.cex_leg->signal.exchange)
-                  << " | " << to_string(pair.cex_leg->status);
-        if (pair.cex_leg->status == OrderStatus::FILLED)
-            std::cout << " | fill=" << pair.cex_leg->avg_fill_price;
+    if (pair.has_cex_leg) {
+        std::cout << "    CEX: " << pair.cex_leg.order_id
+                  << " | " << to_string(pair.cex_leg.signal.exchange)
+                  << " | " << to_string(pair.cex_leg.status);
+        if (pair.cex_leg.status == OrderStatus::FILLED)
+            std::cout << " | fill=" << pair.cex_leg.avg_fill_price;
         std::cout << "\n";
     }
-    if (pair.dex_leg) {
-        std::cout << "    DEX: " << pair.dex_leg->order_id
-                  << " | " << to_string(pair.dex_leg->signal.exchange)
-                  << " | " << to_string(pair.dex_leg->status);
-        if (pair.dex_leg->status == OrderStatus::FILLED)
-            std::cout << " | fill=" << pair.dex_leg->avg_fill_price;
+    if (pair.has_dex_leg) {
+        std::cout << "    DEX: " << pair.dex_leg.order_id
+                  << " | " << to_string(pair.dex_leg.signal.exchange)
+                  << " | " << to_string(pair.dex_leg.status);
+        if (pair.dex_leg.status == OrderStatus::FILLED)
+            std::cout << " | fill=" << pair.dex_leg.avg_fill_price;
         std::cout << "\n";
     }
     if (pair.status == ArbPairStatus::COMPLETED || pair.status == ArbPairStatus::ALL_FILLED) {
@@ -90,18 +92,16 @@ void print_portfolio(const PortfolioState& state) {
     std::cout << "  Portfolio: cash=" << std::fixed << std::setprecision(2) << state.cash
               << " | avail_margin=" << state.available_margin()
               << " | total_value=" << state.total_value() << "\n";
-    for (auto& [sym, pos] : state.positions) {
+    state.positions.for_each([](const std::string& sym, double pos) {
         if (std::abs(pos) > 1e-9) {
             std::cout << "    Position: " << sym << " = " << pos << "\n";
         }
-    }
+    });
 }
 
 int main() {
-    spdlog::set_level(spdlog::level::info);
-
     std::cout << "╔══════════════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║          Order Execution Module — Phase 1 Demo (Mock)               ║\n";
+    std::cout << "║     Order Execution Module — Phase 1 Demo (Low-Latency Optimized)   ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════════════╝\n";
 
     // Load config
@@ -218,7 +218,7 @@ int main() {
         auto signals = DummySignalGenerator::conflict_buy_then_sell();
         mgr.process_signal(signals[0].first);
         std::this_thread::sleep_for(std::chrono::milliseconds(signals[1].second));
-        auto r2 = mgr.process_signal(signals[1].first);
+        mgr.process_signal(signals[1].first);
 
         mgr.wait_for_completion(3000);
 
@@ -226,8 +226,7 @@ int main() {
         for (auto& o : orders) print_order(o);
         print_portfolio(mgr.portfolio().get_state());
 
-        // SELL should have been processed (either accepted or rejected based on cancel result)
-        return true; // TC3 passes if no crash and cancel-and-replace logic executed
+        return true;
     });
 
     // === TC4 ===
@@ -286,7 +285,7 @@ int main() {
         auto gw = make_gateway_map(binance.get(), bybit.get(), hl.get());
         OrderManager::Config cfg{
             .signal_config = {5000, 200},
-            .portfolio_config = {10.0, 1000.0},  // Only 1000 cash
+            .portfolio_config = {10.0, 1000.0},
             .arb_config = {100, 3000, 2000}
         };
         OrderManager mgr(cfg, gw);
@@ -297,7 +296,7 @@ int main() {
         std::cout << "  Result: " << (r.success ? "ACCEPTED" : "REJECTED") << "\n";
         std::cout << "  Reason: " << r.reason << "\n";
 
-        return !r.success && r.reason.find("insufficient_margin") != std::string::npos;
+        return !r.success && std::string(r.reason).find("insufficient_margin") != std::string::npos;
     });
 
     // === TC7 ===
@@ -355,7 +354,7 @@ int main() {
         return (pair.status == ArbPairStatus::COMPLETED ||
                 pair.status == ArbPairStatus::UNWINDING ||
                 pair.status == ArbPairStatus::FAILED) &&
-               pair.dex_leg && pair.dex_leg->status == OrderStatus::REJECTED;
+               pair.has_dex_leg && pair.dex_leg.status == OrderStatus::REJECTED;
     });
 
     // === TC9 ===
@@ -390,6 +389,56 @@ int main() {
         std::cout << "  Spread erosion: " << slippage << " bps\n";
 
         return pair.realized_spread_bps < pair.expected_spread_bps;
+    });
+
+    // === Latency Benchmark ===
+    run_test("BENCH: Hot Path Latency Benchmark", [&]() -> bool {
+        auto binance = std::make_unique<MockCexGateway>(MockCexGateway::Config{.exchange_id = Exchange::BINANCE, .fill_latency_ms = 0});
+        auto bybit = std::make_unique<MockCexGateway>(MockCexGateway::Config{.exchange_id = Exchange::BYBIT, .fill_latency_ms = 0});
+        auto hl = std::make_unique<MockDexGateway>(MockDexGateway::Config{.block_time_ms = 0, .signing_latency_ms = 0});
+        auto gw = make_gateway_map(binance.get(), bybit.get(), hl.get());
+        OrderManager::Config cfg{
+            .signal_config = {5000, 200},
+            .portfolio_config = {10.0, 100000000.0}, // large cash to avoid margin issues
+            .arb_config = {100, 3000, 2000}
+        };
+        OrderManager mgr(cfg, gw);
+
+        const int N = 1000;
+        std::vector<int64_t> latencies;
+        latencies.reserve(N);
+
+        for (int i = 0; i < N; ++i) {
+            Signal sig;
+            sig.set_signal_id(UuidGenerator::signal_id());
+            sig.set_symbol("BTC-PERP");
+            sig.side = Side::BUY;
+            sig.instrument_type = InstrumentType::FUTURES;
+            sig.exchange = Exchange::BINANCE;
+            sig.signal_source = SignalSource::BACKTEST_VALIDATED;
+            sig.quantity = 0.001;
+            sig.price = 100000.0;
+            sig.timestamp_ns = now_ns();
+
+            auto t0 = now_ns();
+            mgr.process_signal(sig);
+            auto t1 = now_ns();
+            latencies.push_back(t1 - t0);
+        }
+
+        mgr.wait_for_completion(10000);
+
+        std::sort(latencies.begin(), latencies.end());
+        auto p50 = latencies[N / 2];
+        auto p99 = latencies[static_cast<int>(N * 0.99)];
+        auto max_lat = latencies[N - 1];
+
+        std::cout << "  Hot path latency (signal -> dispatch):\n";
+        std::cout << "    p50  = " << p50 << " ns (" << std::fixed << std::setprecision(2) << p50 / 1000.0 << " µs)\n";
+        std::cout << "    p99  = " << p99 << " ns (" << p99 / 1000.0 << " µs)\n";
+        std::cout << "    max  = " << max_lat << " ns (" << max_lat / 1000.0 << " µs)\n";
+
+        return true; // Benchmark always passes, just reports numbers
     });
 
     // === Summary ===

@@ -1,8 +1,8 @@
 #pragma once
 #include "../model/order.h"
 #include "../gateway/i_exchange_gateway.h"
-#include "../util/logger.h"
-#include <mutex>
+#include "../util/async_logger.h"
+#include "../util/spinlock.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,41 +18,44 @@ enum class ConflictStrategy {
 
 struct ConflictResult {
     bool can_proceed = true;
-    std::string reason;
+    char reason[128] = {};
     std::vector<std::string> cancelled_order_ids;
+
+    void set_reason(const std::string& r) {
+        std::strncpy(reason, r.c_str(), 127);
+        reason[127] = '\0';
+    }
 };
 
 class ConflictResolver {
 public:
-    ConflictResolver() : strategy_(ConflictStrategy::CANCEL_AND_REPLACE), logger_(get_logger("conflict_resolver")) {}
-    explicit ConflictResolver(ConflictStrategy strategy)
-        : strategy_(strategy)
-        , logger_(get_logger("conflict_resolver")) {}
+    ConflictResolver() : strategy_(ConflictStrategy::CANCEL_AND_REPLACE) {}
+    explicit ConflictResolver(ConflictStrategy strategy) : strategy_(strategy) {}
 
-    // Register an in-flight order
     void register_order(const Order& order) {
-        std::lock_guard lock(mutex_);
-        in_flight_[order.signal.symbol].push_back({
-            .order_id = order.order_id,
-            .exchange_order_id = order.exchange_order_id,
-            .side = order.signal.side,
-            .exchange = order.signal.exchange,
-            .status = order.status
-        });
-        logger_->info("Registered in-flight order {} for {}", order.order_id, order.signal.symbol);
+        SpinLock::Guard lock(mutex_);
+        InFlightEntry entry;
+        std::strncpy(entry.order_id, order.order_id, 15);
+        entry.order_id[15] = '\0';
+        std::strncpy(entry.exchange_order_id, order.exchange_order_id, 31);
+        entry.exchange_order_id[31] = '\0';
+        entry.side = order.signal.side;
+        entry.exchange = order.signal.exchange;
+        entry.status = order.status;
+        in_flight_[order.signal.symbol].push_back(entry);
+        global_logger().info("conflict_resolver", "Registered in-flight order %s for %s",
+                             order.order_id, order.signal.symbol);
     }
 
-    // Check for conflicts before sending a new signal
     ConflictResult check(const Signal& signal,
                          std::unordered_map<Exchange, IExchangeGateway*>& gateways) {
-        std::lock_guard lock(mutex_);
+        SpinLock::Guard lock(mutex_);
 
         auto it = in_flight_.find(signal.symbol);
         if (it == in_flight_.end() || it->second.empty()) {
-            return {true, ""};
+            return {};
         }
 
-        // Find opposite-side in-flight orders
         std::vector<InFlightEntry*> conflicts;
         for (auto& entry : it->second) {
             if (entry.side != signal.side && is_active(entry.status)) {
@@ -61,49 +64,55 @@ public:
         }
 
         if (conflicts.empty()) {
-            return {true, ""};
+            return {};
         }
 
-        logger_->warn("Conflict detected: {} has {} opposite-side in-flight order(s), new signal {}",
-                      signal.symbol, conflicts.size(), signal.signal_id);
+        global_logger().warn("conflict_resolver", "Conflict detected: %s has %zu opposite-side in-flight order(s), new signal %s",
+                             signal.symbol, conflicts.size(), signal.signal_id);
 
         if (strategy_ == ConflictStrategy::REJECT_NEW) {
-            return {false, "conflict: opposite-side order in-flight for " + signal.symbol};
+            ConflictResult r;
+            r.can_proceed = false;
+            std::string reason = "conflict: opposite-side order in-flight for " + std::string(signal.symbol);
+            r.set_reason(reason);
+            return r;
         }
 
         // CANCEL_AND_REPLACE
-        ConflictResult result{true, ""};
+        ConflictResult result;
+        result.can_proceed = true;
         for (auto* conflict : conflicts) {
-            if (conflict->exchange_order_id.empty()) continue;
+            if (conflict->exchange_order_id[0] == '\0') continue;
 
             auto gw_it = gateways.find(conflict->exchange);
             if (gw_it == gateways.end()) continue;
 
-            logger_->info("Cancelling conflicting order {} on {}",
-                         conflict->order_id, to_string(conflict->exchange));
+            global_logger().info("conflict_resolver", "Cancelling conflicting order %s on %s",
+                                 conflict->order_id, to_string(conflict->exchange));
 
             auto cancel_future = gw_it->second->cancel_order(conflict->exchange_order_id);
 
-            // Wait with timeout (500ms)
             auto status = cancel_future.wait_for(std::chrono::milliseconds(500));
             if (status == std::future_status::ready) {
                 auto cancel_result = cancel_future.get();
                 if (cancel_result.success) {
                     conflict->status = OrderStatus::CANCELLED;
                     result.cancelled_order_ids.push_back(conflict->order_id);
-                    logger_->info("Cancel confirmed for {}", conflict->order_id);
+                    global_logger().info("conflict_resolver", "Cancel confirmed for %s", conflict->order_id);
                 } else {
                     result.can_proceed = false;
-                    result.reason = "conflict: cancel of " + conflict->order_id
+                    std::string reason = "conflict: cancel of " + std::string(conflict->order_id)
                         + " failed, rejecting new signal";
-                    logger_->warn("{}", result.reason);
+                    result.set_reason(reason);
+                    global_logger().warn("conflict_resolver", "%s", result.reason);
                     return result;
                 }
             } else {
                 result.can_proceed = false;
-                result.reason = "conflict: cancel of " + conflict->order_id
+                std::string reason = "conflict: cancel of " + std::string(conflict->order_id)
                     + " timed out, rejecting new signal";
-                logger_->warn("{}", result.reason);
+                result.set_reason(reason);
+                global_logger().warn("conflict_resolver", "%s", result.reason);
                 return result;
             }
         }
@@ -111,15 +120,15 @@ public:
         return result;
     }
 
-    // Update order status (call on terminal states)
     void update_status(const std::string& order_id, OrderStatus status) {
-        std::lock_guard lock(mutex_);
+        SpinLock::Guard lock(mutex_);
         for (auto& [symbol, entries] : in_flight_) {
             for (auto& entry : entries) {
-                if (entry.order_id == order_id) {
+                if (std::strcmp(entry.order_id, order_id.c_str()) == 0) {
                     entry.status = status;
                     if (is_terminal(status)) {
-                        logger_->info("Removing terminal order {} from tracking", order_id);
+                        global_logger().info("conflict_resolver", "Removing terminal order %s from tracking",
+                                             order_id.c_str());
                     }
                     return;
                 }
@@ -127,9 +136,8 @@ public:
         }
     }
 
-    // Clean up terminal orders
     void cleanup() {
-        std::lock_guard lock(mutex_);
+        SpinLock::Guard lock(mutex_);
         for (auto& [symbol, entries] : in_flight_) {
             entries.erase(
                 std::remove_if(entries.begin(), entries.end(),
@@ -140,14 +148,14 @@ public:
     }
 
     void reset() {
-        std::lock_guard lock(mutex_);
+        SpinLock::Guard lock(mutex_);
         in_flight_.clear();
     }
 
 private:
     struct InFlightEntry {
-        std::string order_id;
-        std::string exchange_order_id;
+        char order_id[16] = {};
+        char exchange_order_id[32] = {};
         Side side;
         Exchange exchange;
         OrderStatus status;
@@ -160,8 +168,7 @@ private:
 
     ConflictStrategy strategy_;
     std::unordered_map<std::string, std::vector<InFlightEntry>> in_flight_;
-    std::mutex mutex_;
-    std::shared_ptr<spdlog::logger> logger_;
+    SpinLock mutex_;
 };
 
 } // namespace oem

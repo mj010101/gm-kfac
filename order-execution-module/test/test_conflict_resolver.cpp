@@ -43,42 +43,34 @@ protected:
     std::unique_ptr<MockDexGateway> hl_gw_;
 };
 
-// TC3: Buy in-flight, sell arrives → cancel buy → sell dispatched
 TEST_F(ConflictResolverTest, TC3_BuyPendingSellSignal) {
     auto mgr = make_manager();
 
-    // Use higher fill latency to ensure the buy is still in-flight when sell arrives
     binance_gw_->set_config(MockCexGateway::Config{
         .exchange_id = Exchange::BINANCE,
-        .fill_latency_ms = 200  // longer to ensure in-flight
+        .fill_latency_ms = 200
     });
 
     auto signals = DummySignalGenerator::conflict_buy_then_sell();
 
-    // Send BUY
     auto result1 = mgr->process_signal(signals[0].first);
     EXPECT_TRUE(result1.success) << "BUY should succeed: " << result1.reason;
 
-    // Wait for it to be sent but not filled
     std::this_thread::sleep_for(std::chrono::milliseconds(signals[1].second));
 
-    // Send SELL - should trigger cancel of BUY
     auto result2 = mgr->process_signal(signals[1].first);
-    // Result depends on whether cancel succeeds
-    // With mock gateway, cancel should succeed
     EXPECT_TRUE(result2.success) << "SELL should succeed after BUY cancel: " << result2.reason;
 
     mgr->wait_for_completion(3000);
 }
 
-// Same-side test: Two BUY signals for same symbol → no conflict
 TEST_F(ConflictResolverTest, SameSideNoConflict) {
     auto mgr = make_manager();
 
     auto now = now_ns();
     Signal buy1;
-    buy1.signal_id = UuidGenerator::signal_id();
-    buy1.symbol = "ETH-PERP";
+    buy1.set_signal_id(UuidGenerator::signal_id());
+    buy1.set_symbol("ETH-PERP");
     buy1.side = Side::BUY;
     buy1.instrument_type = InstrumentType::FUTURES;
     buy1.exchange = Exchange::BINANCE;
@@ -88,8 +80,8 @@ TEST_F(ConflictResolverTest, SameSideNoConflict) {
     buy1.timestamp_ns = now;
 
     Signal buy2;
-    buy2.signal_id = UuidGenerator::signal_id();
-    buy2.symbol = "ETH-PERP";
+    buy2.set_signal_id(UuidGenerator::signal_id());
+    buy2.set_symbol("ETH-PERP");
     buy2.side = Side::BUY;
     buy2.instrument_type = InstrumentType::FUTURES;
     buy2.exchange = Exchange::BINANCE;
@@ -109,18 +101,13 @@ TEST_F(ConflictResolverTest, SameSideNoConflict) {
     mgr->wait_for_completion(3000);
 }
 
-// Cancel failure test (not easily testable with current mock, but we verify the path exists)
 TEST_F(ConflictResolverTest, CancelFailureRejectsNew) {
-    // This tests the logic path where cancel fails
-    // With the current mock, cancel always succeeds, so we test indirectly
-    // by verifying the ConflictResolver directly
-
     ConflictResolver resolver(ConflictStrategy::REJECT_NEW);
 
     Order existing;
-    existing.order_id = "ORD-000001";
-    existing.exchange_order_id = "EX-ORD-000001";
-    existing.signal.symbol = "BTC-PERP";
+    existing.set_order_id("ORD-000001");
+    existing.set_exchange_order_id("EX-ORD-000001");
+    existing.signal.set_symbol("BTC-PERP");
     existing.signal.side = Side::BUY;
     existing.signal.exchange = Exchange::BINANCE;
     existing.status = OrderStatus::SENT;
@@ -128,12 +115,12 @@ TEST_F(ConflictResolverTest, CancelFailureRejectsNew) {
     resolver.register_order(existing);
 
     Signal sell_signal;
-    sell_signal.signal_id = "SIG-002";
-    sell_signal.symbol = "BTC-PERP";
+    sell_signal.set_signal_id("SIG-002");
+    sell_signal.set_symbol("BTC-PERP");
     sell_signal.side = Side::SELL;
     sell_signal.exchange = Exchange::BINANCE;
 
     auto result = resolver.check(sell_signal, gateways_);
     EXPECT_FALSE(result.can_proceed);
-    EXPECT_TRUE(result.reason.find("conflict") != std::string::npos);
+    EXPECT_TRUE(std::string(result.reason).find("conflict") != std::string::npos);
 }

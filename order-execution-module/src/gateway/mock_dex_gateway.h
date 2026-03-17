@@ -1,7 +1,7 @@
 #pragma once
 #include "i_dex_gateway.h"
 #include "../util/uuid.h"
-#include "../util/logger.h"
+#include "../util/async_logger.h"
 #include "../util/latency_tracker.h"
 #include <atomic>
 #include <chrono>
@@ -24,10 +24,9 @@ public:
         double slippage_bps = 0.0;
     };
 
-    MockDexGateway() : config_(), logger_(get_logger("dex_gateway")), rng_(std::random_device{}()) {}
+    MockDexGateway() : config_(), rng_(std::random_device{}()) {}
     explicit MockDexGateway(Config config)
         : config_(config)
-        , logger_(get_logger("dex_gateway"))
         , rng_(std::random_device{}()) {}
 
     ~MockDexGateway() override {
@@ -52,25 +51,23 @@ public:
             auto start = now_ns();
             auto nonce = next_nonce();
 
-            // Simulate EIP-712 signing
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.signing_latency_ms));
 
-            auto tx_hash = UuidGenerator::tx_hash();
+            auto tx_hash_str = UuidGenerator::tx_hash();
 
-            logger_->info("Order {} TX_PENDING on HYPERLIQUID, tx_hash={}, nonce={}",
-                         order.order_id, tx_hash, nonce);
+            global_logger().info("dex_gateway", "Order %s TX_PENDING on HYPERLIQUID, tx_hash=%s, nonce=%llu",
+                                 order.order_id, tx_hash_str.c_str(), (unsigned long long)nonce);
 
-            // Schedule block confirmation
-            schedule_block_confirm(order, tx_hash);
+            schedule_block_confirm(order, tx_hash_str);
 
-            return OrderResult{
-                .success = true,
-                .exchange_order_id = "HL-" + order.order_id,
-                .status = OrderStatus::TX_PENDING,
-                .error_message = "",
-                .latency_ns = now_ns() - start,
-                .tx_hash = tx_hash
-            };
+            OrderResult r;
+            r.success = true;
+            std::string hl_id = std::string("HL-") + order.order_id;
+            r.set_exchange_order_id(hl_id);
+            r.status = OrderStatus::TX_PENDING;
+            r.latency_ns = now_ns() - start;
+            r.set_tx_hash(tx_hash_str);
+            return r;
         });
     }
 
@@ -84,14 +81,19 @@ public:
                 cancelled_orders_.insert(exchange_order_id);
             }
 
-            logger_->info("Order {} CANCELLED on HYPERLIQUID", exchange_order_id);
-            return CancelResult{.success = true};
+            global_logger().info("dex_gateway", "Order %s CANCELLED on HYPERLIQUID",
+                                 exchange_order_id.c_str());
+            CancelResult r;
+            r.success = true;
+            return r;
         });
     }
 
     std::future<OrderStatusResult> query_order(const std::string& /*exchange_order_id*/) override {
         return std::async(std::launch::async, []() -> OrderStatusResult {
-            return OrderStatusResult{.status = OrderStatus::FILLED};
+            OrderStatusResult r;
+            r.status = OrderStatus::FILLED;
+            return r;
         });
     }
 
@@ -105,39 +107,34 @@ public:
     void set_config(const Config& config) { config_ = config; }
 
 private:
-    void schedule_block_confirm(const Order& order, const std::string& tx_hash) {
+    void schedule_block_confirm(const Order& order, const std::string& tx_hash_str) {
         std::lock_guard lock(threads_mutex_);
-        pending_threads_.emplace_back([this, order, tx_hash]() {
-            // Simulate block confirmation delay
+        pending_threads_.emplace_back([this, order, tx_hash_str]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.block_time_ms));
 
-            auto exch_id = "HL-" + order.order_id;
+            std::string exch_id = std::string("HL-") + order.order_id;
 
-            // Check if cancelled
             {
                 std::lock_guard lock2(cancelled_mutex_);
                 if (cancelled_orders_.count(exch_id)) {
-                    logger_->info("Order {} was cancelled, no confirm", exch_id);
+                    global_logger().info("dex_gateway", "Order %s was cancelled, no confirm", exch_id.c_str());
                     return;
                 }
             }
 
-            // Check reject
             {
                 std::lock_guard lock2(rng_mutex_);
                 std::uniform_real_distribution<> dist(0.0, 1.0);
                 if (dist(rng_) < config_.reject_probability) {
-                    logger_->warn("Order {} REJECTED during block confirm on HYPERLIQUID",
-                                 order.order_id);
-                    // Send a reject fill
-                    Fill reject_fill{
-                        .exchange_order_id = exch_id,
-                        .filled_qty = 0.0,
-                        .fill_price = 0.0,
-                        .fill_timestamp_ns = now_ns(),
-                        .is_final = true,
-                        .tx_hash = tx_hash
-                    };
+                    global_logger().warn("dex_gateway", "Order %s REJECTED during block confirm on HYPERLIQUID",
+                                         order.order_id);
+                    Fill reject_fill;
+                    reject_fill.set_exchange_order_id(exch_id);
+                    reject_fill.filled_qty = 0.0;
+                    reject_fill.fill_price = 0.0;
+                    reject_fill.fill_timestamp_ns = now_ns();
+                    reject_fill.is_final = true;
+                    reject_fill.set_tx_hash(tx_hash_str);
                     std::lock_guard lock3(callback_mutex_);
                     if (fill_callback_) {
                         fill_callback_(reject_fill);
@@ -156,17 +153,16 @@ private:
                 }
             }
 
-            logger_->info("Order {} TX_CONFIRMED and FILLED on HYPERLIQUID at price {:.2f}, tx_hash={}",
-                         order.order_id, fill_price, tx_hash);
+            global_logger().info("dex_gateway", "Order %s TX_CONFIRMED and FILLED on HYPERLIQUID at price %.2f, tx_hash=%s",
+                                 order.order_id, fill_price, tx_hash_str.c_str());
 
-            Fill fill{
-                .exchange_order_id = exch_id,
-                .filled_qty = order.signal.quantity,
-                .fill_price = fill_price,
-                .fill_timestamp_ns = now_ns(),
-                .is_final = true,
-                .tx_hash = tx_hash
-            };
+            Fill fill;
+            fill.set_exchange_order_id(exch_id);
+            fill.filled_qty = order.signal.quantity;
+            fill.fill_price = fill_price;
+            fill.fill_timestamp_ns = now_ns();
+            fill.is_final = true;
+            fill.set_tx_hash(tx_hash_str);
 
             std::lock_guard lock2(callback_mutex_);
             if (fill_callback_) {
@@ -176,7 +172,6 @@ private:
     }
 
     Config config_;
-    std::shared_ptr<spdlog::logger> logger_;
     std::mt19937 rng_;
     std::mutex rng_mutex_;
     std::atomic<uint64_t> nonce_{0};

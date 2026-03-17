@@ -46,7 +46,6 @@ protected:
     std::unique_ptr<MockDexGateway> hl_gw_;
 };
 
-// TC1: Sequential Cross-Symbol Orders
 TEST_F(OrderManagerTest, TC1_SequentialCrossSymbol) {
     auto mgr = make_manager();
     auto signals = DummySignalGenerator::sequential_cross_symbol();
@@ -70,18 +69,15 @@ TEST_F(OrderManagerTest, TC1_SequentialCrossSymbol) {
     }
 
     auto state = mgr->portfolio().get_state();
-    // Both orders should have margin tracked
-    EXPECT_GT(state.margin_used.size(), 0u);
+    EXPECT_GT(state.margin_used_size(), 0u);
 }
 
-// TC2: Concurrent Multi-Symbol Orders
 TEST_F(OrderManagerTest, TC2_ConcurrentMultiSymbol) {
     auto mgr = make_manager();
     auto signals = DummySignalGenerator::concurrent_multi_symbol();
 
     auto start = std::chrono::steady_clock::now();
 
-    // Dispatch all at once
     for (auto& [sig, delay_ms] : signals) {
         auto result = mgr->process_signal(sig);
         EXPECT_TRUE(result.success) << "Signal " << sig.signal_id << " failed: " << result.reason;
@@ -100,40 +96,32 @@ TEST_F(OrderManagerTest, TC2_ConcurrentMultiSymbol) {
             << "Order " << order.order_id << " status: " << to_string(order.status);
     }
 
-    // Total time should be ~max(individual) not sum
-    // HL takes ~1000ms, CEX takes ~50ms
-    // Should be around 1000-1500ms, not 1100+ if sequential
     EXPECT_LT(elapsed, 3000) << "Took too long: " << elapsed << "ms (expected parallel execution)";
 }
 
-// TC5: Stale Signal Rejection
 TEST_F(OrderManagerTest, TC5_StaleSignalRejection) {
     auto mgr = make_manager();
     auto signals = DummySignalGenerator::stale_signal();
 
-    // First signal: DIRECT, 300ms old → should be rejected
     auto result1 = mgr->process_signal(signals[0].first);
     EXPECT_FALSE(result1.success);
-    EXPECT_TRUE(result1.reason.find("stale_signal") != std::string::npos)
+    EXPECT_TRUE(std::string(result1.reason).find("stale_signal") != std::string::npos)
         << "Reason: " << result1.reason;
-    EXPECT_TRUE(result1.reason.find("DIRECT") != std::string::npos)
+    EXPECT_TRUE(std::string(result1.reason).find("DIRECT") != std::string::npos)
         << "Reason should mention DIRECT: " << result1.reason;
 
-    // Second signal: BACKTEST, 3s old → should pass (threshold 5000ms)
     auto result2 = mgr->process_signal(signals[1].first);
     EXPECT_TRUE(result2.success) << "Backtest signal should pass: " << result2.reason;
 
     mgr->wait_for_completion(3000);
 }
 
-// TC6: Insufficient Margin
 TEST_F(OrderManagerTest, TC6_InsufficientMargin) {
-    // Set cash to 1000 so 10 BTC @ 100000 with 10x leverage = 100000 margin fails
     auto mgr = make_manager(1000.0);
     auto signals = DummySignalGenerator::insufficient_margin();
 
     auto result = mgr->process_signal(signals[0].first);
     EXPECT_FALSE(result.success);
-    EXPECT_TRUE(result.reason.find("insufficient_margin") != std::string::npos)
+    EXPECT_TRUE(std::string(result.reason).find("insufficient_margin") != std::string::npos)
         << "Reason: " << result.reason;
 }

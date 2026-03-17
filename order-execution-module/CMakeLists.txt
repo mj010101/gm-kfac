@@ -18,14 +18,6 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-# spdlog
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.13.0
-    GIT_SHALLOW    TRUE
-)
-
 # GoogleTest
 FetchContent_Declare(
     googletest
@@ -34,7 +26,7 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(json spdlog googletest)
+FetchContent_MakeAvailable(json googletest)
 
 # --- Main Executable ---
 add_executable(order_execution
@@ -43,7 +35,6 @@ add_executable(order_execution
 target_include_directories(order_execution PRIVATE src)
 target_link_libraries(order_execution PRIVATE
     nlohmann_json::nlohmann_json
-    spdlog::spdlog
     pthread
 )
 
@@ -62,7 +53,6 @@ add_executable(order_execution_tests
 target_include_directories(order_execution_tests PRIVATE src test)
 target_link_libraries(order_execution_tests PRIVATE
     nlohmann_json::nlohmann_json
-    spdlog::spdlog
     GTest::gtest_main
     pthread
 )

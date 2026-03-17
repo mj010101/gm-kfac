@@ -2,7 +2,7 @@
 #include "signal.h"
 #include "../util/latency_tracker.h"
 #include <cstdint>
-#include <optional>
+#include <cstring>
 #include <string>
 
 namespace oem {
@@ -12,15 +12,15 @@ enum class OrderStatus {
     VALIDATING,
     PENDING,
     SENT,
-    TX_PENDING,      // DEX: tx broadcast, waiting for block
-    TX_CONFIRMED,    // DEX: included in block
-    ACKNOWLEDGED,    // CEX: exchange accepted
+    TX_PENDING,
+    TX_CONFIRMED,
+    ACKNOWLEDGED,
     PARTIAL_FILL,
     FILLED,
     CANCELLED,
     REJECTED,
     TIMEOUT,
-    UNWINDING        // arb leg failure, reversing position
+    UNWINDING
 };
 
 inline const char* to_string(OrderStatus s) {
@@ -54,16 +54,31 @@ inline bool is_in_flight(OrderStatus s) {
 
 struct OrderResult {
     bool success = false;
-    std::string exchange_order_id;
+    char exchange_order_id[32] = {};
     OrderStatus status = OrderStatus::REJECTED;
-    std::string error_message;
+    char error_message[64] = {};
     int64_t latency_ns = 0;
-    std::optional<std::string> tx_hash;
+    char tx_hash[32] = {};
+    bool has_tx_hash = false;
+
+    void set_exchange_order_id(const std::string& id) {
+        std::strncpy(exchange_order_id, id.c_str(), 31);
+        exchange_order_id[31] = '\0';
+    }
+    void set_error_message(const std::string& msg) {
+        std::strncpy(error_message, msg.c_str(), 63);
+        error_message[63] = '\0';
+    }
+    void set_tx_hash(const std::string& h) {
+        std::strncpy(tx_hash, h.c_str(), 31);
+        tx_hash[31] = '\0';
+        has_tx_hash = true;
+    }
 };
 
 struct CancelResult {
     bool success = false;
-    std::string error_message;
+    char error_message[64] = {};
 };
 
 struct OrderStatusResult {
@@ -73,17 +88,28 @@ struct OrderStatusResult {
 };
 
 struct Fill {
-    std::string exchange_order_id;
+    char exchange_order_id[32] = {};
     double filled_qty = 0.0;
     double fill_price = 0.0;
     int64_t fill_timestamp_ns = 0;
     bool is_final = false;
-    std::optional<std::string> tx_hash;
+    char tx_hash[32] = {};
+    bool has_tx_hash = false;
+
+    void set_exchange_order_id(const std::string& id) {
+        std::strncpy(exchange_order_id, id.c_str(), 31);
+        exchange_order_id[31] = '\0';
+    }
+    void set_tx_hash(const std::string& h) {
+        std::strncpy(tx_hash, h.c_str(), 31);
+        tx_hash[31] = '\0';
+        has_tx_hash = true;
+    }
 };
 
-struct Order {
-    std::string     order_id;
-    std::string     exchange_order_id;
+struct alignas(64) Order {
+    char            order_id[16] = {};
+    char            exchange_order_id[32] = {};
     Signal          signal;
     OrderStatus     status = OrderStatus::CREATED;
     double          filled_quantity = 0.0;
@@ -91,13 +117,33 @@ struct Order {
     int64_t         created_at_ns = 0;
     int64_t         sent_at_ns = 0;
     int64_t         last_update_ns = 0;
-    std::string     reject_reason;
+    char            reject_reason[64] = {};
 
     // DEX-specific
-    std::optional<std::string> tx_hash;
-    std::optional<int64_t>     tx_confirmed_ns;
+    char            tx_hash[32] = {};
+    bool            has_tx_hash = false;
+    int64_t         tx_confirmed_ns = 0;
+    bool            has_tx_confirmed_ns = false;
 
-    LatencyMetrics latency;
+    LatencyMetrics  latency;
+
+    void set_order_id(const std::string& id) {
+        std::strncpy(order_id, id.c_str(), 15);
+        order_id[15] = '\0';
+    }
+    void set_exchange_order_id(const std::string& id) {
+        std::strncpy(exchange_order_id, id.c_str(), 31);
+        exchange_order_id[31] = '\0';
+    }
+    void set_reject_reason(const std::string& r) {
+        std::strncpy(reject_reason, r.c_str(), 63);
+        reject_reason[63] = '\0';
+    }
+    void set_tx_hash(const std::string& h) {
+        std::strncpy(tx_hash, h.c_str(), 31);
+        tx_hash[31] = '\0';
+        has_tx_hash = true;
+    }
 };
 
 } // namespace oem

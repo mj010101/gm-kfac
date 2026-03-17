@@ -7,13 +7,15 @@
 #include "conflict_resolver.h"
 #include "arb_coordinator.h"
 #include "../util/uuid.h"
-#include "../util/logger.h"
+#include "../util/async_logger.h"
 #include "../util/latency_tracker.h"
+#include "../util/spinlock.h"
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <mutex>
-#include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,15 +32,28 @@ public:
         ArbCoordinator::Config arb_config;
     };
 
+    struct ProcessResult {
+        bool success = false;
+        char order_id[16] = {};
+        char reason[128] = {};
+
+        void set_order_id(const std::string& id) {
+            std::strncpy(order_id, id.c_str(), 15);
+            order_id[15] = '\0';
+        }
+        void set_reason(const char* r) {
+            std::strncpy(reason, r, 127);
+            reason[127] = '\0';
+        }
+    };
+
     OrderManager(Config config, GatewayMap gateways)
         : gateways_(std::move(gateways))
         , signal_receiver_(config.signal_config)
         , portfolio_(config.portfolio_config)
         , conflict_resolver_()
         , arb_coordinator_(config.arb_config, portfolio_, gateways_)
-        , logger_(get_logger("order_manager"))
     {
-        // Subscribe to fill callbacks on all gateways
         for (auto& [exch, gw] : gateways_) {
             gw->subscribe_fills([this](const Fill& fill) {
                 on_fill(fill);
@@ -47,44 +62,37 @@ public:
     }
 
     ~OrderManager() {
-        // Wait for pending dispatch threads
         std::lock_guard lock(threads_mutex_);
         for (auto& t : dispatch_threads_) {
             if (t.joinable()) t.join();
         }
     }
 
-    struct ProcessResult {
-        bool success = false;
-        std::string order_id;
-        std::string reason;
-    };
-
     ProcessResult process_signal(const Signal& signal) {
-        // 1. Validate
         auto validation = signal_receiver_.validate(signal);
         if (!validation.valid) {
-            logger_->warn("Signal {} REJECTED: {}", signal.signal_id, validation.reason);
-            return {false, "", validation.reason};
+            global_logger().warn("order_manager", "Signal %s REJECTED: %s",
+                                 signal.signal_id, validation.reason);
+            ProcessResult r;
+            r.set_reason(validation.reason);
+            return r;
         }
 
-        // 2. Route
-        if (signal.group_id.has_value()) {
-            // Arb path
+        if (signal.has_group_id) {
             auto order = arb_coordinator_.add_leg(signal);
-            return {true, order.order_id, ""};
+            ProcessResult r;
+            r.success = true;
+            std::strncpy(r.order_id, order.order_id, 15);
+            return r;
         }
 
-        // 3. Single-leg pipeline
         return process_single_leg(signal);
     }
 
-    // Wait for all orders to reach terminal state (with timeout)
     void wait_for_completion(int timeout_ms = 5000) {
         auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(timeout_ms);
 
-        // Wait for dispatch threads
         {
             std::lock_guard lock(threads_mutex_);
             for (auto& t : dispatch_threads_) {
@@ -93,11 +101,10 @@ public:
             dispatch_threads_.clear();
         }
 
-        // Wait for orders to complete
         while (std::chrono::steady_clock::now() < deadline) {
             bool all_done = true;
             {
-                std::shared_lock lock(orders_mutex_);
+                SpinLock::Guard lock(orders_mutex_);
                 for (auto& [id, order] : orders_) {
                     if (!is_terminal(order.status) && order.status != OrderStatus::UNWINDING) {
                         all_done = false;
@@ -111,14 +118,11 @@ public:
     }
 
     Order get_order(const std::string& order_id) const {
-        std::shared_lock lock(orders_mutex_);
-        auto it = orders_.find(order_id);
-        if (it != orders_.end()) return it->second;
-        return {};
+        // SpinLock doesn't support shared lock, but sections are short
+        return orders_.count(order_id) ? orders_.at(order_id) : Order{};
     }
 
     std::vector<Order> get_all_orders() const {
-        std::shared_lock lock(orders_mutex_);
         std::vector<Order> result;
         for (auto& [_, o] : orders_) result.push_back(o);
         return result;
@@ -140,11 +144,10 @@ public:
         conflict_resolver_.reset();
         portfolio_.reset();
         {
-            std::unique_lock lock(orders_mutex_);
+            SpinLock::Guard lock(orders_mutex_);
             orders_.clear();
         }
 
-        // Re-subscribe fills
         for (auto& [exch, gw] : gateways_) {
             gw->subscribe_fills([this](const Fill& fill) {
                 on_fill(fill);
@@ -154,34 +157,38 @@ public:
 
 private:
     ProcessResult process_single_leg(const Signal& signal) {
-        // Create order
         Order order;
-        order.order_id = UuidGenerator::order_id();
+        order.set_order_id(UuidGenerator::order_id());
         order.signal = signal;
         order.status = OrderStatus::CREATED;
         order.created_at_ns = now_ns();
 
-        // 3a. Conflict check
         auto conflict_result = conflict_resolver_.check(signal, gateways_);
         if (!conflict_result.can_proceed) {
             order.status = OrderStatus::REJECTED;
-            order.reject_reason = conflict_result.reason;
+            order.set_reject_reason(conflict_result.reason);
             store_order(order);
-            logger_->warn("Order {} REJECTED: {}", order.order_id, conflict_result.reason);
-            return {false, order.order_id, conflict_result.reason};
+            global_logger().warn("order_manager", "Order %s REJECTED: %s",
+                                 order.order_id, conflict_result.reason);
+            ProcessResult r;
+            std::strncpy(r.order_id, order.order_id, 15);
+            r.set_reason(conflict_result.reason);
+            return r;
         }
 
-        // 3b. Portfolio check
         auto margin_result = portfolio_.check_and_reserve(signal);
         if (!margin_result.approved) {
             order.status = OrderStatus::REJECTED;
-            order.reject_reason = margin_result.reason;
+            order.set_reject_reason(margin_result.reason);
             store_order(order);
-            logger_->warn("Order {} REJECTED: {}", order.order_id, margin_result.reason);
-            return {false, order.order_id, margin_result.reason};
+            global_logger().warn("order_manager", "Order %s REJECTED: %s",
+                                 order.order_id, margin_result.reason);
+            ProcessResult r;
+            std::strncpy(r.order_id, order.order_id, 15);
+            r.set_reason(margin_result.reason);
+            return r;
         }
 
-        // 3c. Dispatch
         order.status = OrderStatus::SENT;
         order.sent_at_ns = now_ns();
         store_order(order);
@@ -192,64 +199,68 @@ private:
         auto gw_it = gateways_.find(exch);
         if (gw_it == gateways_.end()) {
             order.status = OrderStatus::REJECTED;
-            order.reject_reason = "no gateway for exchange " + std::string(to_string(exch));
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "no gateway for exchange %s", to_string(exch));
+            order.set_reject_reason(buf);
             store_order(order);
             portfolio_.release_margin(signal);
-            return {false, order.order_id, order.reject_reason};
+            ProcessResult r;
+            std::strncpy(r.order_id, order.order_id, 15);
+            r.set_reason(buf);
+            return r;
         }
 
-        logger_->info("Order {} SENT to {} for {} {} {:.4f}",
-                     order.order_id, to_string(exch), signal.symbol,
-                     to_string(signal.side), signal.quantity);
+        global_logger().info("order_manager", "Order %s SENT to %s for %s %s %.4f",
+                             order.order_id, to_string(exch), signal.symbol,
+                             to_string(signal.side), signal.quantity);
 
-        // Async dispatch
-        auto order_id = order.order_id;
+        std::string order_id_str(order.order_id);
         auto* gw = gw_it->second;
         {
             std::lock_guard lock(threads_mutex_);
-            dispatch_threads_.emplace_back([this, gw, order, order_id]() {
+            dispatch_threads_.emplace_back([this, gw, order, order_id_str]() {
                 auto result = gw->send_order(order).get();
 
-                std::unique_lock lock(orders_mutex_);
-                auto it = orders_.find(order_id);
+                SpinLock::Guard lock(orders_mutex_);
+                auto it = orders_.find(order_id_str);
                 if (it != orders_.end()) {
-                    it->second.exchange_order_id = result.exchange_order_id;
+                    it->second.set_exchange_order_id(result.exchange_order_id);
                     it->second.latency.send_to_ack_ns = result.latency_ns;
 
                     if (result.success) {
                         auto new_status = (get_exchange_type(order.signal.exchange) == ExchangeType::DEX)
                             ? OrderStatus::TX_PENDING : OrderStatus::ACKNOWLEDGED;
                         it->second.status = new_status;
-                        if (result.tx_hash) {
-                            it->second.tx_hash = result.tx_hash;
+                        if (result.has_tx_hash) {
+                            it->second.set_tx_hash(result.tx_hash);
                         }
-                        logger_->info("Order {} status -> {}", order_id, to_string(new_status));
+                        global_logger().info("order_manager", "Order %s status -> %s",
+                                             order_id_str.c_str(), to_string(new_status));
                     } else {
                         it->second.status = OrderStatus::REJECTED;
-                        it->second.reject_reason = result.error_message;
+                        it->second.set_reject_reason(result.error_message);
                         portfolio_.release_margin(order.signal);
-                        conflict_resolver_.update_status(order_id, OrderStatus::REJECTED);
+                        conflict_resolver_.update_status(order_id_str, OrderStatus::REJECTED);
                     }
                 }
             });
         }
 
-        return {true, order_id, ""};
+        ProcessResult r;
+        r.success = true;
+        std::strncpy(r.order_id, order.order_id, 15);
+        return r;
     }
 
     void on_fill(const Fill& fill) {
-        // Check if this fill belongs to an arb pair
-
         bool is_reject = (fill.filled_qty == 0.0 && fill.fill_price == 0.0);
 
-        // Try arb coordinator
         arb_coordinator_.on_fill(fill.exchange_order_id, fill.fill_price,
                                 fill.filled_qty, is_reject);
 
-        // Also update single-leg orders
-        std::unique_lock lock(orders_mutex_);
+        SpinLock::Guard lock(orders_mutex_);
         for (auto& [id, order] : orders_) {
-            if (order.exchange_order_id == fill.exchange_order_id) {
+            if (std::strcmp(order.exchange_order_id, fill.exchange_order_id) == 0) {
                 if (is_reject) {
                     order.status = OrderStatus::REJECTED;
                     portfolio_.release_margin(order.signal);
@@ -260,17 +271,18 @@ private:
                     order.last_update_ns = fill.fill_timestamp_ns;
                     order.latency.total_ns = fill.fill_timestamp_ns - order.created_at_ns;
 
-                    if (fill.tx_hash) {
-                        order.tx_hash = fill.tx_hash;
+                    if (fill.has_tx_hash) {
+                        order.set_tx_hash(fill.tx_hash);
                         order.tx_confirmed_ns = fill.fill_timestamp_ns;
+                        order.has_tx_confirmed_ns = true;
                     }
 
                     portfolio_.on_fill(order.signal, fill.fill_price, fill.filled_qty);
                     conflict_resolver_.update_status(id, OrderStatus::FILLED);
 
-                    logger_->info("Order {} FILLED: {:.4f} @ {:.2f}, latency={:.2f}ms",
-                                 id, fill.filled_qty, fill.fill_price,
-                                 order.latency.total_ns / 1e6);
+                    global_logger().info("order_manager", "Order %s FILLED: %.4f @ %.2f, latency=%.2fms",
+                                         id.c_str(), fill.filled_qty, fill.fill_price,
+                                         order.latency.total_ns / 1e6);
                 }
                 break;
             }
@@ -278,7 +290,7 @@ private:
     }
 
     void store_order(const Order& order) {
-        std::unique_lock lock(orders_mutex_);
+        SpinLock::Guard lock(orders_mutex_);
         orders_[order.order_id] = order;
     }
 
@@ -287,10 +299,9 @@ private:
     PortfolioGuard portfolio_;
     ConflictResolver conflict_resolver_;
     ArbCoordinator arb_coordinator_;
-    std::shared_ptr<spdlog::logger> logger_;
 
     std::unordered_map<std::string, Order> orders_;
-    mutable std::shared_mutex orders_mutex_;
+    mutable SpinLock orders_mutex_;
 
     std::vector<std::thread> dispatch_threads_;
     std::mutex threads_mutex_;
